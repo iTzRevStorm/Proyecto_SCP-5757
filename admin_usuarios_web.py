@@ -5,36 +5,33 @@ import base64
 from datetime import timedelta
 from flask import Flask, request, redirect, url_for, render_template_string, session, flash, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
-# Importamos la librería de criptografía
 from cryptography.fernet import Fernet
+# ¡NUEVO! Importamos la librería de PostgreSQL
+import psycopg2
+import psycopg2.extras
 
 # --- Configuración de la Aplicación Flask ---
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'SCP-Foundation-Secure-Key-918273'
-app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5MB Límite para imágenes
+app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=30)
-DATABASE = 'usuarios.db'
+# ¡NUEVO! Leemos la URL de la base de datos desde las variables de entorno de Render
+DATABASE_URL = os.environ.get('DATABASE_URL')
 
 # --- LISTA DE ROLES ---
 ROLES = ['admin', 'Supervisor', 'Bodeguero central', 'Bodeguero', 'Obrero', 'user']
 
 # --- CONFIGURACIÓN DE ENCRIPTACIÓN SIMÉTRICA (Fernet) ---
-# Esta es la "llave maestra" para encriptar/desencriptar reportes.
 MASTER_KEY = b'pC02-FCS3IeA3m2j-psH_oVSnB6z5gV8zX2b-vV-pII='
 f = Fernet(MASTER_KEY)
 
 def encrypt_data(data):
-    """Encripta datos (debe ser string o bytes)"""
-    if data is None:
-        return None
-    if isinstance(data, str):
-        data = data.encode('utf-8')
+    if data is None: return None
+    if isinstance(data, str): data = data.encode('utf-8')
     return f.encrypt(data).decode('utf-8')
 
 def decrypt_data(encrypted_data):
-    """Desencripta datos (debe ser string)"""
-    if encrypted_data is None:
-        return None
+    if encrypted_data is None: return None
     try:
         decrypted_bytes = f.decrypt(encrypted_data.encode('utf-8'))
         return decrypted_bytes.decode('utf-8')
@@ -51,26 +48,29 @@ SCP_LOGO_SVG = """
     <path d="M44 35 L44 50 L35 50 L50 65 L65 50 L56 50 L56 35 L44 35"/>
     <path d="M44 35 L44 50 L35 50 L50 65 L65 50 L56 50 L56 35 L44 35" transform="rotate(120 50 50)"/>
     <path d="M44 35 L44 50 L35 50 L50 65 L65 50 L56 50 L56 35 L44 35" transform="rotate(240 50 50)"/>
-svg>
+</svg>
 """
 
-# --- Funciones de la Base de Datos (SQLite) ---
+# --- Funciones de la Base de Datos (¡TRADUCIDAS A POSTGRESQL!) ---
 
 def get_db_connection():
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
+    # Conecta a la base de datos de Render usando la URL
+    conn = psycopg2.connect(DATABASE_URL)
     return conn
 
 def init_db():
     conn = get_db_connection()
+    # Usamos un cursor para ejecutar comandos
     cursor = conn.cursor()
     
-    # 1. Tabla de Usuarios (Con columna 'status' para reseteo de clave)
-    if not cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'").fetchone():
+    # 1. Tabla de Usuarios (Sintaxis de PostgreSQL)
+    # Comprueba si la tabla existe
+    cursor.execute("SELECT to_regclass('public.users')")
+    if cursor.fetchone()[0] is None:
         print("Creando la tabla 'users'...")
-        conn.execute('''
+        cursor.execute('''
         CREATE TABLE users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             username TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL,
             role TEXT NOT NULL DEFAULT 'user',
@@ -79,20 +79,16 @@ def init_db():
         ''')
         print("Usuario 'admin' por defecto creado (pass: 'admin')")
         admin_pass_hash = generate_password_hash('admin')
-        conn.execute("INSERT INTO users (username, password_hash, role, status) VALUES (?, ?, ?, ?)",('admin', admin_pass_hash, 'admin', 'active'))
-    else:
-        try:
-            conn.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
-            print("Columna 'status' añadida a la tabla 'users'.")
-        except sqlite3.OperationalError:
-            pass # La columna ya existe
-
+        cursor.execute("INSERT INTO users (username, password_hash, role, status) VALUES (%s, %s, %s, %s)",
+                       ('admin', admin_pass_hash, 'admin', 'active'))
+    
     # 2. Tabla de Herramientas
-    if not cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='tools'").fetchone():
+    cursor.execute("SELECT to_regclass('public.tools')")
+    if cursor.fetchone()[0] is None:
         print("Creando la tabla 'tools' (inventario)...")
-        conn.execute('''
+        cursor.execute('''
         CREATE TABLE tools (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             nombre TEXT NOT NULL UNIQUE,
             descripcion TEXT,
             stock INTEGER NOT NULL
@@ -104,14 +100,15 @@ def init_db():
             ('Set de Llaves', 'Item-003: Seguro', 20),
             ('Martillo', 'Item-004: Seguro', 30)
         ]
-        conn.executemany('INSERT INTO tools (nombre, descripcion, stock) VALUES (?, ?, ?)', tools_data)
+        cursor.executemany('INSERT INTO tools (nombre, descripcion, stock) VALUES (%s, %s, %s)', tools_data)
 
-    # 3. Tabla de Reportes (Con columna 'imagen_base64')
-    if not cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reportes'").fetchone():
+    # 3. Tabla de Reportes
+    cursor.execute("SELECT to_regclass('public.reportes')")
+    if cursor.fetchone()[0] is None:
         print("Creando la tabla 'reportes'...")
-        conn.execute('''
+        cursor.execute('''
         CREATE TABLE reportes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             user_id INTEGER NOT NULL,
             titulo TEXT NOT NULL,
             contenido TEXT NOT NULL,
@@ -121,12 +118,14 @@ def init_db():
         )
         ''')
     else:
+        # Asegurarnos que la columna de imagen exista (manejo de errores simple)
         try:
-            conn.execute('ALTER TABLE reportes ADD COLUMN imagen_base64 TEXT')
-        except sqlite3.OperationalError:
-            pass 
+            cursor.execute('ALTER TABLE reportes ADD COLUMN imagen_base64 TEXT')
+        except psycopg2.Error:
+            pass # La columna ya existe, no hacemos nada
 
-    conn.commit()
+    conn.commit() # Guardamos los cambios
+    cursor.close()
     conn.close()
     print("Base de datos inicializada y asegurada.")
 
@@ -146,11 +145,9 @@ def check_password_reset(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'user_id' in session and session.get('status') == 'must_reset':
-            # Si el usuario está en sesión Y su status es 'must_reset',
-            # lo forzamos a la página de reseteo, a menos que YA ESTÉ en ella.
             if request.endpoint not in ['force_reset', 'logout']:
                 flash('DEBE CAMBIAR SU CONTRASEÑA ANTES DE CONTINUAR.', 'error')
-                return redirect(url_for('force_reset'))
+                return redirect(url_for('force_reset', username=session['username'])) # Pasamos el username
         return f(*args, **kwargs)
     return decorated_function
 
@@ -172,40 +169,38 @@ def role_required(*roles):
 def make_session_permanent():
     session.permanent = True
 
-# --- Rutas de la Aplicación ---
+# --- Rutas de la Aplicación (Traducidas a PostgreSQL) ---
 
 @app.route('/', methods=['GET', 'POST'])
 def login():
-    reset_approved = request.args.get('reset_approved')
-    if reset_approved:
-        flash('¡Reseteo Aprobado! Inicie sesión con su contraseña ANTIGUA para crear una nueva.', 'error') # Marcado como error para que resalte
-
     if request.method == 'POST':
         username = request.form['username']
         password = request.form['password']
         
         conn = get_db_connection()
-        user = conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
+        # Usamos un cursor que devuelve diccionarios
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        # Usamos %s como placeholder
+        cursor.execute('SELECT * FROM users WHERE username = %s', (username,))
+        user = cursor.fetchone()
+        cursor.close()
         conn.close()
         
         if user and check_password_hash(user['password_hash'], password):
+            if user['status'] == 'must_reset':
+                flash('AUTORIZACIÓN DE RESETEO RECIBIDA. Debe crear una nueva clave.', 'success')
+                return redirect(url_for('force_reset', username=user['username']))
+            
+            if user['status'] == 'pending_reset':
+                flash('Solicitud de reseteo enviada. Esperando autorización de un Admin.', 'error')
+                return redirect(url_for('login'))
+
             session['user_id'] = user['id']
             session['username'] = user['username']
             session['role'] = user['role']
             session['status'] = user['status']
             session.permanent = True
-            
-            # 1. ¿Necesita resetear clave?
-            if user['status'] == 'must_reset':
-                flash('AUTORIZACIÓN DE RESETEO RECIBIDA. Debe crear una nueva clave.', 'success')
-                return redirect(url_for('force_reset'))
-            
-            # 2. ¿Su reseteo está pendiente?
-            if user['status'] == 'pending_reset':
-                flash('Solicitud de reseteo enviada. Esperando autorización de un Admin.', 'error')
-                return redirect(url_for('login'))
 
-            # 3. Login normal
             if user['role'] == 'admin':
                 return redirect(url_for('dashboard_admin'))
             elif user['role'] == 'Supervisor':
@@ -247,15 +242,19 @@ def reset_request():
     if request.method == 'POST':
         username = request.form['username']
         conn = get_db_connection()
-        user = conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cursor.execute('SELECT * FROM users WHERE username = %s', (username,))
+        user = cursor.fetchone()
         
         if user:
-            conn.execute("UPDATE users SET status = 'pending_reset' WHERE id = ?", (user['id'],))
+            cursor.execute("UPDATE users SET status = 'pending_reset' WHERE id = %s", (user['id'],))
             conn.commit()
+            cursor.close()
             conn.close()
             return redirect(url_for('wait_for_approval', username=username))
         else:
             flash('Usuario no encontrado.', 'error')
+            cursor.close()
             conn.close()
             return redirect(url_for('reset_request'))
         
@@ -266,19 +265,20 @@ def wait_for_approval():
     username = request.args.get('username')
     if not username:
         return redirect(url_for('login'))
-    
     return render_template_string(WAITING_TEMPLATE, username=username)
 
 @app.route('/check_approval_status')
 def check_approval_status():
     username = request.args.get('username')
     conn = get_db_connection()
-    user = conn.execute('SELECT status FROM users WHERE username = ?', (username,)).fetchone()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    cursor.execute('SELECT status FROM users WHERE username = %s', (username,))
+    user = cursor.fetchone()
+    cursor.close()
     conn.close()
     
     if user:
         if user['status'] == 'must_reset':
-            # CAMBIO DE LÓGICA: Redirigimos a force_reset
             return jsonify({'status': 'approved', 'redirect_url': url_for('force_reset', username=username)})
         else:
             return jsonify({'status': 'pending'})
@@ -287,7 +287,6 @@ def check_approval_status():
 
 @app.route('/force_reset', methods=['GET', 'POST'])
 def force_reset():
-    # CAMBIO DE LÓGICA: Esta página no requiere login
     if request.method == 'POST':
         username = request.form['username']
         new_password = request.form['new_password']
@@ -300,21 +299,25 @@ def force_reset():
         new_password_hash = generate_password_hash(new_password)
         
         conn = get_db_connection()
-        conn.execute("UPDATE users SET password_hash = ?, status = 'active' WHERE username = ?", (new_password_hash, username))
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET password_hash = %s, status = 'active' WHERE username = %s", (new_password_hash, username))
         conn.commit()
+        cursor.close()
         conn.close()
         
         flash('Contraseña actualizada exitosamente. Por favor, inicie sesión.', 'success')
         return redirect(url_for('login'))
 
-    # Si es GET, verificamos el usuario y el status
     username = request.args.get('username')
     if not username:
         flash('Solicitud inválida. Falta usuario.', 'error')
         return redirect(url_for('login'))
     
     conn = get_db_connection()
-    user = conn.execute('SELECT status FROM users WHERE username = ?', (username,)).fetchone()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    cursor.execute('SELECT status FROM users WHERE username = %s', (username,))
+    user = cursor.fetchone()
+    cursor.close()
     conn.close()
     
     if not user or user['status'] != 'must_reset':
@@ -328,8 +331,10 @@ def force_reset():
 def approve_reset():
     user_id = request.form['user_id']
     conn = get_db_connection()
-    conn.execute("UPDATE users SET status = 'must_reset' WHERE id = ?", (user_id,))
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET status = 'must_reset' WHERE id = %s", (user_id,))
     conn.commit()
+    cursor.close()
     conn.close()
     flash('Reseteo autorizado. El usuario será redirigido para crear una nueva clave.', 'success')
     return redirect(url_for('dashboard_admin', vista='solicitudes'))
@@ -346,17 +351,21 @@ def dashboard_admin():
     buscar_query = request.args.get('buscar_query', '')
     
     conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     
     if vista_activa == 'lista':
-        users = conn.execute("SELECT * FROM users WHERE status != 'pending_reset'").fetchall()
+        cursor.execute("SELECT * FROM users WHERE status != 'pending_reset'")
+        users = cursor.fetchall()
     
     elif vista_activa == 'buscar':
         if buscar_query:
             query = f"%{buscar_query}%"
-            users = conn.execute("SELECT * FROM users WHERE username LIKE ? AND status != 'pending_reset'", (query,)).fetchall()
+            cursor.execute("SELECT * FROM users WHERE username LIKE %s AND status != 'pending_reset'", (query,))
+            users = cursor.fetchall()
     
     elif vista_activa == 'reportes':
-        reportes_enc = conn.execute("SELECT r.*, u.username FROM reportes r JOIN users u ON r.user_id = u.id ORDER BY r.id DESC").fetchall()
+        cursor.execute("SELECT r.*, u.username FROM reportes r JOIN users u ON r.user_id = u.id ORDER BY r.id DESC")
+        reportes_enc = cursor.fetchall()
         for r in reportes_enc:
             reportes.append({
                 'id': r['id'], 'username': r['username'],
@@ -367,11 +376,14 @@ def dashboard_admin():
             })
         
     elif vista_activa == 'inventario':
-        inventario = conn.execute("SELECT * FROM tools ORDER BY nombre").fetchall()
+        cursor.execute("SELECT * FROM tools ORDER BY nombre")
+        inventario = cursor.fetchall()
 
     elif vista_activa == 'solicitudes':
-        solicitudes = conn.execute("SELECT id, username FROM users WHERE status = 'pending_reset'").fetchall()
+        cursor.execute("SELECT id, username FROM users WHERE status = 'pending_reset'")
+        solicitudes = cursor.fetchall()
     
+    cursor.close()
     conn.close()
     
     return render_template_string(
@@ -393,15 +405,19 @@ def dashboard_admin():
 @role_required('Supervisor')
 def dashboard_supervisor():
     vista_activa = request.args.get('vista', 'crear_reporte')
-    obreros = []
-    stock_bodega = []
     reportes = []
     
     conn = get_db_connection()
-    obreros = conn.execute("SELECT id, username FROM users WHERE role = 'Obrero'").fetchall()
-    stock_bodega = conn.execute("SELECT * FROM tools ORDER BY nombre").fetchall()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     
-    reportes_enc = conn.execute("SELECT r.*, u.username FROM reportes r JOIN users u ON r.user_id = u.id ORDER BY r.id DESC").fetchall()
+    cursor.execute("SELECT id, username FROM users WHERE role = 'Obrero'")
+    obreros = cursor.fetchall()
+    
+    cursor.execute("SELECT * FROM tools ORDER BY nombre")
+    stock_bodega = cursor.fetchall()
+    
+    cursor.execute("SELECT r.*, u.username FROM reportes r JOIN users u ON r.user_id = u.id ORDER BY r.id DESC")
+    reportes_enc = cursor.fetchall()
     for r in reportes_enc:
         reportes.append({
             'id': r['id'], 'username': r['username'],
@@ -410,6 +426,7 @@ def dashboard_supervisor():
             'fecha_creacion': r['fecha_creacion'],
             'imagen_base64': decrypt_data(r['imagen_base64'])
         })
+    cursor.close()
     conn.close()
     
     return render_template_string(
@@ -429,7 +446,10 @@ def dashboard_supervisor():
 def dashboard_bodeguero():
     vista_activa = request.args.get('vista', 'inventario')
     conn = get_db_connection()
-    inventario = conn.execute("SELECT * FROM tools ORDER BY nombre").fetchall()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    cursor.execute("SELECT * FROM tools ORDER BY nombre")
+    inventario = cursor.fetchall()
+    cursor.close()
     conn.close()
     
     return render_template_string(
@@ -447,7 +467,10 @@ def dashboard_bodeguero():
 def dashboard_obrero():
     vista_activa = request.args.get('vista', 'pedir')
     conn = get_db_connection()
-    herramientas_disponibles = conn.execute("SELECT * FROM tools WHERE stock > 0 ORDER BY nombre").fetchall()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    cursor.execute("SELECT * FROM tools WHERE stock > 0 ORDER BY nombre")
+    herramientas_disponibles = cursor.fetchall()
+    cursor.close()
     conn.close()
 
     return render_template_string(
@@ -489,11 +512,13 @@ def crear_reporte():
     imagen_base64_enc = encrypt_data(imagen_base64) 
 
     conn = get_db_connection()
-    conn.execute(
-        'INSERT INTO reportes (user_id, titulo, contenido, fecha_creacion, imagen_base64) VALUES (?, ?, ?, ?, ?)',
+    cursor = conn.cursor()
+    cursor.execute(
+        'INSERT INTO reportes (user_id, titulo, contenido, fecha_creacion, imagen_base64) VALUES (%s, %s, %s, %s, %s)',
         (user_id, titulo_enc, contenido_enc, fecha, imagen_base64_enc)
     )
     conn.commit()
+    cursor.close()
     conn.close()
     
     flash('Reporte archivado y encriptado.', 'success')
@@ -511,13 +536,16 @@ def crear_usuario():
     role = request.form['role']
     password_hash = generate_password_hash(password)
     conn = get_db_connection()
+    cursor = conn.cursor()
     try:
-        conn.execute('INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)', (username, password_hash, role))
+        cursor.execute('INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s)', (username, password_hash, role))
         conn.commit()
         flash(f'Sujeto "{username}" registrado exitosamente.', 'success')
-    except sqlite3.IntegrityError:
+    except (psycopg2.Error, psycopg2.IntegrityError):
+        conn.rollback() # Deshacemos la transacción en caso de error
         flash(f'Error: Designación de sujeto "{username}" ya existe.', 'error')
     finally:
+        cursor.close()
         conn.close()
     return redirect(url_for('dashboard_admin'))
 
@@ -526,8 +554,10 @@ def crear_usuario():
 def eliminar_usuario():
     user_id = request.form['user_id']
     conn = get_db_connection()
-    conn.execute('DELETE FROM users WHERE id = ? AND username != ?', (user_id, 'admin'))
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM users WHERE id = %s AND username != %s', (user_id, 'admin'))
     conn.commit()
+    cursor.close()
     conn.close()
     flash('Sujeto eliminado.', 'success')
     return redirect(url_for('dashboard_admin', vista='lista'))
@@ -538,8 +568,10 @@ def cambiar_rol():
     user_id = request.form['user_id']
     new_role = request.form['new_role']
     conn = get_db_connection()
-    conn.execute('UPDATE users SET role = ? WHERE id = ? AND username != ?', (new_role, user_id, 'admin'))
+    cursor = conn.cursor()
+    cursor.execute('UPDATE users SET role = %s WHERE id = %s AND username != %s', (new_role, user_id, 'admin'))
     conn.commit()
+    cursor.close()
     conn.close()
     flash('Nivel de autorización actualizado.', 'success')
     return redirect(url_for('dashboard_admin', vista='lista'))
@@ -550,13 +582,16 @@ def editar_nombre():
     user_id = request.form['user_id']
     new_username = request.form['new_username']
     conn = get_db_connection()
+    cursor = conn.cursor()
     try:
-        conn.execute('UPDATE users SET username = ? WHERE id = ? AND username != ?', (new_username, user_id, 'admin'))
+        cursor.execute('UPDATE users SET username = %s WHERE id = %s AND username != %s', (new_username, user_id, 'admin'))
         conn.commit()
         flash('Designación de sujeto actualizada.', 'success')
-    except sqlite3.IntegrityError:
+    except (psycopg2.Error, psycopg2.IntegrityError):
+        conn.rollback()
         flash(f'Error: Designación "{new_username}" ya existe.', 'error')
     finally:
+        cursor.close()
         conn.close()
     return redirect(url_for('dashboard_admin', vista='lista'))
 
@@ -565,13 +600,16 @@ def editar_nombre():
 def pedir_herramienta():
     tool_id = request.form['tool_id']
     conn = get_db_connection()
-    tool = conn.execute('SELECT stock, nombre FROM tools WHERE id = ?', (tool_id,)).fetchone()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    cursor.execute('SELECT stock, nombre FROM tools WHERE id = %s', (tool_id,))
+    tool = cursor.fetchone()
     if tool and tool['stock'] > 0:
-        conn.execute('UPDATE tools SET stock = stock - 1 WHERE id = ?', (tool_id,))
+        cursor.execute('UPDATE tools SET stock = stock - 1 WHERE id = %s', (tool_id,))
         conn.commit()
         flash(f'Item "{tool["nombre"]}" retirado de contención.', 'success')
     else:
         flash(f'Error: Item "{tool["nombre"]}" sin stock.', 'error')
+    cursor.close()
     conn.close()
     return redirect(url_for('dashboard_obrero'))
 
@@ -581,14 +619,17 @@ def agregar_stock():
     tool_id = request.form['tool_id']
     cantidad = int(request.form['cantidad'])
     
+    conn = get_db_connection()
+    cursor = conn.cursor()
     if cantidad > 0:
-        conn = get_db_connection()
-        conn.execute('UPDATE tools SET stock = stock + ? WHERE id = ?', (cantidad, tool_id))
+        cursor.execute('UPDATE tools SET stock = stock + %s WHERE id = %s', (cantidad, tool_id))
         conn.commit()
-        conn.close()
         flash(f'{cantidad} unidades añadidas a contención.', 'success')
     else:
         flash('Cantidad debe ser positiva.', 'error')
+    
+    cursor.close()
+    conn.close()
     
     if session['role'] == 'admin':
         return redirect(url_for('dashboard_admin', vista='inventario'))
@@ -839,7 +880,6 @@ LOGIN_TEMPLATE = """
     <div class="theme-toggle" id="theme-toggle">☀️</div>
     
     <div id="easter-egg" class="easter-egg">
-        <!-- ARREGLO FINAL: Imagen "Waton Linux" convertida a Base64 -->
         <img src="data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAYEBAUEBAYFBQUGBgYHCQ4JCQgICRINDQoOFBAPDQ4NDgwTERQUFhITFhcWGRkSExAbHRsYHRYYGRziISLfIjed/2wBDAQYHBwYIChgQChAPHRQfHR8fHR8fHR8fHR8fHR8fHR8fHR8fHR8fHR8fHR8fHR8fHR8fHR8fHR8fHR8fHR8fHR//wAARCADvAU4DASIAAhEBAxEB/8QAGwABAQADAQEBAAAAAAAAAAAAAAMCBAUGAQf/xAAzEAEAAgECBgICAQMDBQEAAAAAAQIDBBEFEiETMVGBUWEiMkFxgZEFNEKhscHwIzOi4f/EABgBAQEBAQEAAAAAAAAAAAAAAAABAgME/8QAGhEBAQEBAQEBAAAAAAAAAAAAAAERIQISUf/aAAwDAQACEQMRAD8A/SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAfm94rFExaZnwiIiZmZc8XJkyd+zxVj/vO/1GzS26SazrzT/AIxG/wDlnJyZctzPFMR/tGv7tE1F61JFKV6xWsaREQN9cTT0m8z5REzLIsHNPGsVmZtWZ4ZmZ3JAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD4tataxWtasUiNaREbA5ScmTJvEzFY/2xv+7qDRi0VrFaxWKxGkREbEQAAAAAAAAAAAAAAAABz5sFclYmJmLRGkbR4S6Akz4MmPvzxT/ALxv+GqLWtpHFKzWeIiYl0xMTEraJiY8JidphrTqAAAAAAAAAAAAAAAACfN0/vXis/6RO36y1Zsd8dum9J1idYnwiYkQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABkw5Jxb1tOkxtMeMQ2AcuLPS9YrERWsxEzG+8+TqAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA//Z" alt="Waton Linux Easter Egg">
         <p>Waton Linux</p>
     </div>
@@ -2550,7 +2590,12 @@ FORCE_RESET_TEMPLATE = """
 
 # --- Punto de Entrada Principal ---
 if __name__ == '__main__':
-    init_db()
+    # Esta función SÍ debe llamarse aquí.
+    # Gunicorn no la llamará, pero si ejecutas 
+    # 'python admin_usuarios_web.py' localmente,
+    # SÍ la llamará, creando tu BD local.
+    init_db() 
+    
     host_ip = '0.0.0.0' 
     print(f"Iniciando servidor web en http://{host_ip}:5000")
     print("SCP Secure Terminal está en línea. Accesible en la red local.")
