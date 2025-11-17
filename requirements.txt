@@ -2,3 +2,4 @@ Flask
 cryptography
 werkzeug
 gunicorn
+psycopg2-binary
